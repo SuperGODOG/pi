@@ -8,9 +8,10 @@ import type {
 	Model,
 	OpenAICompletionsCompat,
 } from "@earendil-works/pi-ai/compat";
-import { getApiProvider, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";
+import { getApiProvider, getModels, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import type { ModelsJsonProvider } from "../src/core/model-config.ts";
 import { clearApiKeyCache, type ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.ts";
 
 import { createModelRegistry } from "./model-runtime-test-utils.ts";
@@ -713,6 +714,52 @@ describe("ModelRegistry", () => {
 			expect(opus?.name).not.toBe("Custom Sonnet Name");
 		});
 
+		test("Anthropic model override replaces allowed fallback metadata", async () => {
+			const allowedFallbackModels = [
+				{
+					provider: "anthropic",
+					model: "claude-opus-5",
+					cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+				},
+				{
+					provider: "anthropic",
+					model: "claude-opus-4-8",
+					cost: { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
+				},
+			];
+			writeRawModelsJson({
+				anthropic: {
+					modelOverrides: {
+						"claude-fable-5": {
+							compat: { allowedFallbackModels },
+						},
+					},
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			const compat = registry.find("anthropic", "claude-fable-5")?.compat as AnthropicMessagesCompat | undefined;
+
+			expect(registry.getError()).toBeUndefined();
+			expect(compat?.allowedFallbackModels).toEqual(allowedFallbackModels);
+		});
+
+		test("empty allowed fallback model override disables server-side fallback", async () => {
+			writeRawModelsJson({
+				anthropic: {
+					modelOverrides: {
+						"claude-fable-5": { compat: { allowedFallbackModels: [] } },
+					},
+				},
+			});
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			const compat = registry.find("anthropic", "claude-fable-5")?.compat as AnthropicMessagesCompat | undefined;
+
+			expect(registry.getError()).toBeUndefined();
+			expect(compat?.allowedFallbackModels).toEqual([]);
+		});
+
 		test("custom model and model override carry sampling params", async () => {
 			writeRawModelsJson({
 				openrouter: {
@@ -765,6 +812,26 @@ describe("ModelRegistry", () => {
 			const sonnet = models.find((m) => m.id === "anthropic/claude-sonnet-4");
 			const compat = sonnet?.compat as OpenAICompletionsCompat | undefined;
 			expect(compat?.openRouterRouting).toEqual({ only: ["amazon-bedrock"] });
+		});
+
+		test("supportsFinishReason can be configured at provider and model levels", async () => {
+			const provider: ModelsJsonProvider = {
+				compat: { supportsFinishReason: true },
+				modelOverrides: {
+					"anthropic/claude-sonnet-4": {
+						compat: { supportsFinishReason: false },
+					},
+				},
+			};
+			writeRawModelsJson({ openrouter: provider });
+
+			const registry = await createModelRegistry(authStorage, modelsJsonPath);
+			const models = getModelsForProvider(registry, "openrouter");
+			const sonnet = models.find((model) => model.id === "anthropic/claude-sonnet-4");
+			const opus = models.find((model) => model.id === "anthropic/claude-opus-4");
+
+			expect((sonnet?.compat as OpenAICompletionsCompat | undefined)?.supportsFinishReason).toBe(false);
+			expect((opus?.compat as OpenAICompletionsCompat | undefined)?.supportsFinishReason).toBe(true);
 		});
 
 		test("model override deep merges compat settings", async () => {
@@ -1858,12 +1925,15 @@ describe("ModelRegistry", () => {
 			});
 
 			test("getAvailable filters GitHub Copilot OAuth models to account picker availability", async () => {
+				const copilotModel = getModels("github-copilot")[0];
+				if (!copilotModel) throw new Error("Expected at least one GitHub Copilot model");
+
 				await authStorage.modify("github-copilot", async () => ({
 					type: "oauth",
 					refresh: "github-access-token",
 					access: "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
 					expires: Date.now() + 60_000,
-					availableModelIds: ["gpt-4.1"],
+					availableModelIds: [copilotModel.id],
 				}));
 
 				const registry = await createModelRegistry(authStorage, modelsJsonPath);
@@ -1873,7 +1943,7 @@ describe("ModelRegistry", () => {
 						.getAvailable()
 						.filter((m) => m.provider === "github-copilot")
 						.map((m) => m.id),
-				).toEqual(["gpt-4.1"]);
+				).toEqual([copilotModel.id]);
 			});
 
 			test("getApiKeyAndHeaders resolves authHeader on every request", async () => {
